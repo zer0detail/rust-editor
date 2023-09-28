@@ -12,6 +12,12 @@ const STATUS_BG_COLOR: color::Rgb = color::Rgb(239, 239, 239);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const QUIT_TIMES: u8 = 3;
 
+#[derive(PartialEq, Copy, Clone)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
 #[derive(Default, Clone)]
 pub struct Position {
     pub x: usize,
@@ -38,6 +44,7 @@ pub struct Editor {
     document: Document,
     status_message: StatusMessage,
     quit_times: u8,
+    highlighted_word: Option<String>,
 }
 
 impl Editor {
@@ -64,6 +71,7 @@ impl Editor {
             document,
             status_message: StatusMessage::from(initial_status),
             quit_times: QUIT_TIMES,
+            highlighted_word: None,
         }
     }
     pub fn run(&mut self) {
@@ -80,13 +88,14 @@ impl Editor {
         }
     }
 
-    fn refresh_screen(&self) -> Result<(), std::io::Error> {
+    fn refresh_screen(&mut self) -> Result<(), std::io::Error> {
         Terminal::cursor_hide();
         Terminal::cursor_position(&Position::default());
         if self.should_quit {
             Terminal::clear_screen();
             println!("Goodbye.\r");
         } else {
+            self.document.highlight(&self.highlighted_word, Some(self.offset.y.saturating_add(self.terminal.size().height as usize),),);
             self.draw_rows();
             self.draw_status_bar();
             self.draw_message_bar();
@@ -117,37 +126,36 @@ impl Editor {
 
     fn search(&mut self) {
         let old_position = self.cursor_position.clone();
-        if let Some(query) = self
+        let mut direction = SearchDirection::Forward;
+        let query = self
             .prompt(
                 "Search (ESC to cancel, Arrows to navigate): ",
                 |editor, key, query| {
                     let mut moved = false;
                     match key {
                         Key::Right | Key::Down => {
+                            direction = SearchDirection::Forward;
                             editor.move_cursor(Key::Right);
                             moved = true;
                         }
-                        _ => (),
+                        Key::Left | Key::Up => direction = SearchDirection::Backward,
+                        _ => direction = SearchDirection::Forward,
                     }
-                    if let Some(position) = editor.document.find(&query, &editor.cursor_position) {
+                    if let Some(position) = editor.document.find(&query, &editor.cursor_position, direction) {
                         editor.cursor_position = position;
                         editor.scroll();
                     } else if moved {
                         editor.move_cursor(Key::Left);
                     }
+                    editor.highlighted_word = (Some(query.to_string()));
                 },
-            )
-            .unwrap_or(None)
-        {
-            if let Some(position) = self.document.find(&query[..], &old_position) {
-                self.cursor_position = position;
-            } else {
-                self.status_message = StatusMessage::from(format!("Not Found: {}", query));
-            }
-        } else {
-            self.cursor_position = old_position;
-            self.scroll();
-        }
+            ).unwrap_or(None);
+        
+            if query.is_none() {
+                self.cursor_position = old_position;
+                self.scroll();
+            } 
+        self.highlighted_word = None;
     }
     fn process_keypress(&mut self) -> Result<(), std::io::Error> {
         let pressed_key = Terminal::read_key()?;
@@ -198,7 +206,7 @@ impl Editor {
         let Position { x, y } = self.cursor_position;
         let width = self.terminal.size().width as usize;
         let height = self.terminal.size().height as usize;
-        let mut offset = &mut self.offset;
+        let offset = &mut self.offset;
         if y < offset.y {
             offset.y = y;
         } else if y >= offset.y.saturating_add(height) {
@@ -332,7 +340,8 @@ impl Editor {
             modified_indicator
         );
         let line_indicator = format!(
-            "{}/{}",
+            "{} | {}/{}",
+            self.document.file_type(),
             self.cursor_position.y.saturating_add(1),
             self.document.len()
         );
@@ -357,9 +366,9 @@ impl Editor {
             print!("{}", text);
         }
     }
-    fn prompt<C>(&mut self, prompt: &str, callback: C) -> Result<Option<String>, std::io::Error>
+    fn prompt<C>(&mut self, prompt: &str, mut callback: C) -> Result<Option<String>, std::io::Error>
     where
-        C: Fn(&mut Self, Key, &String),
+        C: FnMut(&mut Self, Key, &String),
     {
         let mut result = String::new();
         loop {
